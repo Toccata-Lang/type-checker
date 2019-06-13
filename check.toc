@@ -1,0 +1,150 @@
+
+(deftype Dummy [path])
+
+(add-ns sm (git-dependency "https://github.com/Toccata-Lang/state-maybe.git"
+                           "state-maybe.toc"
+                           :sha "f655efc"))
+(add-ns const (git-dependency "https://github.com/Toccata-Lang/constraints.git"
+                              "constraints.toc"
+                              :sha "3435b1b"))
+(add-ns ast (git-dependency "https://github.com/Toccata-Lang/ast.git"
+                            "ast.toc"
+                            :sha "ffd6095"))
+(add-ns rdr (git-dependency "https://github.com/Toccata-Lang/reader.git"
+                            "reader.toc"
+                            :sha "6673103"))
+(add-ns rd (git-dependency "https://github.com/Toccata-Lang/recursive-descent.git"
+                           "recursive-descent.toc"
+                           :sha "1c09660"))
+(add-ns grmr (git-dependency "https://github.com/Toccata-Lang/grammar.git"
+                             "grammar.toc"
+                             :sha "1e280ff"))
+(add-ns ev (git-dependency "https://github.com/Toccata-Lang/eval.git"
+                           "eval.toc"
+                           :sha "d861de8"))
+
+(defn debug [& args]
+  (map (wrap sm/zero-sm "") (fn [_]
+                           (apply print-err args))))
+
+(def top-level
+  (grmr/recursive-rule "top-level"
+                       (grmr/any rdr/read-main
+                                 rdr/read-JS-callable
+                                 rdr/read-inline
+                                 rdr/read-def
+                                 rdr/read-defprotocol
+                                 rdr/read-defn
+                                 rdr/read-extend-type
+                                 rdr/read-deftype
+                                 rdr/read-block-comment
+                                 rdr/read-add-ns
+                                 rdr/read-call
+                                 rdr/shebang
+                                 rdr/bad-expr)))
+
+(def analyze-forms
+  (rd/parser (grmr/none-or-more
+              (grmr/any
+               ;; (grmr/apply-fn (fn [modules]
+               ;;                  (map modules extract))
+               ;;                (grmr/one-or-more
+               ;;                 (grmr/apply-fn add-namespace
+               ;;                                rdr/read-add-ns
+               ;;                                (grmr/get-value 'root-directory)
+               ;;                                (grmr/get-value 'project-directory))))
+               top-level))))
+
+(defprotocol TypeChecker
+  (unify [c1 c2])
+  (f [ast]))
+
+(extend-type const/Constraints
+  TypeChecker
+  (unify [c1 c2]
+    (const/compose-constraints (ast/file-name c1)
+                               (ast/line-number c1)
+                               c1 c2)))
+
+(extend-type const/TypeConstraint
+  TypeChecker
+  (f [c1]
+    (let [sym (extract (.sym c1))]
+      (for [t-maps (comp (sm/get-in-val ['types (.type-sym c1)])
+                         (wrap sm/zero-sm {}))
+            :let [c1 (.type-maps c1 t-maps)]
+            _ (comp (for [cs (sm/get-in-val ['subs sym])
+                          :let [new-cs (or (every cs (fn [c2]
+                                                       (unify c1 c2)))
+                                           (do
+                                             (print-err 'boom)
+                                             (maybe (abort))))]
+                          _ (sm/assoc-in-val ['subs sym] (extract new-cs))]
+                      '_)
+                    (sm/assoc-in-val ['subs sym] [c1]))]
+        '_))))
+
+(extend-type ast/definition-ast
+  TypeChecker
+  (f [ast]
+    (let [[expr] (filter (.value-exprs ast) (partial instance? ast/CodeAST))]
+      (flat-map (f expr)
+                (partial sm/assoc-in-val ['syms (.sym ast)])))))
+
+(extend-type ast/fn-ast
+  TypeChecker
+  (f [ast]
+    (let [[arity] (.arities ast)]
+      (f arity))))
+
+(extend-type ast/fn-arity-ast
+  TypeChecker
+  (f [ast]
+    (wrap sm/zero-sm
+          (fn [& param-syms]
+            (ev/traverse (.body ast) f)))))
+
+(extend-type ast/call-ast
+  TypeChecker
+  (f [ast]
+    (for [checker (sm/get-in-val ['syms (.call-target ast)])
+          _ (apply checker (seq (.args ast)))]
+      '_)))
+
+(def input-text "
+(defn tf [x]
+  (or (assert (instance? String x))
+      (assert (instance? Integer x))))
+
+(tf x)
+")
+
+(main [_]
+  ;; (print-err 'comp (unify (const/TypeConstraint {1 #{}} (list [_FILE_ _LINE_]) 'SomeType (maybe 'x) "")
+  ;;                         (const/TypeConstraint {2 #{}} (list [_FILE_ _LINE_]) 'AnotherType (maybe 'y) "")))
+  (let [st (maybe ['_ {'types {'Integer {const/IntegerType #{}}
+                               'String {const/SubStringType #{}
+                                        const/StringBufferType #{}}}
+                       'subs {}
+                       'syms {}}])]
+    (for [asts (analyze-forms {'file-name 'test
+                               'line-number 1
+                               'project-directory ""
+                               'root-directory ""}
+                              input-text)]
+      (print-err (reduce asts st
+                         (fn [st ast]
+                           (flat-map st (fn [[_ new-st]]
+                                          ((f ast) new-st)))))))))
+
+;; map over param constraints replacing with more restrictive arg constraints
+;; remove any arg constratints that are satisfied by new param constraints
+;; concat remaining arg constraints with new param constraints
+;; assoc constraints with param syms
+;; ass result constraints with result sym
+
+;; (defn f [arity-ast]
+;;   (fn [subs]
+;;     (let [[expr & exprs] (map (.body arity-ast) f)]
+;;       (reduce exprs (expr subs) (fn [subs expr]
+;;                                   (flat-map subs expr))))))
