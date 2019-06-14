@@ -1,9 +1,8 @@
 
 (deftype Dummy [path])
 
-(add-ns sm (git-dependency "https://github.com/Toccata-Lang/state-maybe.git"
-                           "state-maybe.toc"
-                           :sha "f655efc"))
+(add-ns sv (module "state-vect.toc"))
+
 (add-ns const (git-dependency "https://github.com/Toccata-Lang/constraints.git"
                               "constraints.toc"
                               :sha "3435b1b"))
@@ -24,7 +23,7 @@
                            :sha "d861de8"))
 
 (defn debug [& args]
-  (map (wrap sm/zero-sm "") (fn [_]
+  (map (wrap sv/zero-sv "") (fn [_]
                            (apply print-err args))))
 
 (def top-level
@@ -39,7 +38,7 @@
                                  rdr/read-deftype
                                  rdr/read-block-comment
                                  rdr/read-add-ns
-                                 rdr/read-call
+                                 rdr/read-expr
                                  rdr/shebang
                                  rdr/bad-expr)))
 
@@ -56,86 +55,119 @@
                top-level))))
 
 (defprotocol TypeChecker
-  (unify [c1 c2])
   (f [ast]))
-
-(extend-type const/Constraints
-  TypeChecker
-  (unify [c1 c2]
-    (const/compose-constraints (ast/file-name c1)
-                               (ast/line-number c1)
-                               c1 c2)))
 
 (extend-type const/TypeConstraint
   TypeChecker
   (f [c1]
     (let [sym (extract (.sym c1))]
-      (for [t-maps (comp (sm/get-in-val ['types (.type-sym c1)])
-                         (wrap sm/zero-sm {}))
+      (for [t-maps (sv/get-in-val ['types (.type-sym c1)] {})
             :let [c1 (.type-maps c1 t-maps)]
-            _ (comp (for [cs (sm/get-in-val ['subs sym])
-                          :let [new-cs (or (every cs (fn [c2]
-                                                       (unify c1 c2)))
-                                           (do
-                                             (print-err 'boom)
-                                             (maybe (abort))))]
-                          _ (sm/assoc-in-val ['subs sym] (extract new-cs))]
-                      '_)
-                    (sm/assoc-in-val ['subs sym] [c1]))]
-        '_))))
+            c (for [c2 (sv/get-in-val ['subs sym] const/top-type)
+                    :let [new-cs (either (const/compose-constraints (ast/file-name c1)
+                                                                    (ast/line-number c1)
+                                                                    c1 c2)
+                                         (do
+                                           (print-err 'boom)
+                                           (abort)))]
+                    _ (sv/assoc-in-val ['subs sym] new-cs)]
+                new-cs)]
+        c))))
 
 (extend-type ast/definition-ast
   TypeChecker
   (f [ast]
     (let [[expr] (filter (.value-exprs ast) (partial instance? ast/CodeAST))]
       (flat-map (f expr)
-                (partial sm/assoc-in-val ['syms (.sym ast)])))))
+                (partial sv/assoc-in-val ['syms (.sym ast)])))))
 
 (extend-type ast/fn-ast
   TypeChecker
   (f [ast]
     (let [[arity] (.arities ast)]
-      (f arity))))
+      (f (.fn-sym arity (.fn-sym ast))))))
+
+(defn chain
+  ([] sv/zero-sv)
+  ([mv] mv)
+  ([mv & mvs]
+   (sv/new-sv (fn [s]
+                (flat-map (mv s)
+                          (fn [[_ new-s]]
+                            ((apply chain mvs) new-s)))))))
 
 (extend-type ast/fn-arity-ast
   TypeChecker
   (f [ast]
-    (wrap sm/zero-sm
+    (wrap sv/zero-sv
           (fn [& param-syms]
-            (ev/traverse (.body ast) f)))))
+            (let [param-map (reduce (zip-lists param-syms (.fixed (.params ast)))
+                                    {}
+                                    (fn [m [param var]]
+                                      (assoc m param var)))]
+              (for [subs (sv/get-val 'subs)
+                    :let [before-subs (reduce (zip-lists param-syms (.fixed (.params ast)))
+                                              subs
+                                              (fn [m [param var]]
+                                                (either (map (get m param)
+                                                             (partial assoc m var))
+                                                        m)))]
+                    _ (sv/set-val 'subs before-subs)
+                    r (apply chain (seq (map (.body ast) f)))
+                    after-subs (sv/get-val 'subs)
+                    :let [final-subs (reduce (zip-lists param-syms (.fixed (.params ast)))
+                                             after-subs
+                                             (fn [m [param var]]
+                                               (either (map (get m var)
+                                                            (partial assoc m param))
+                                                       m)))]
+                    _ (sv/set-val 'subs final-subs)]
+                r))))))
 
 (extend-type ast/call-ast
   TypeChecker
   (f [ast]
-    (for [checker (sm/get-in-val ['syms (.call-target ast)])
-          _ (apply checker (seq (.args ast)))]
-      '_)))
+    (for [checker (sv/get-in-val ['syms (.call-target ast)])
+          c (apply checker (seq (.args ast)))]
+      c)))
+
+(extend-type ast/or-ast
+  TypeChecker
+  (f [ast]
+    (apply comp (seq (map (.clauses ast) f)))))
 
 (def input-text "
 (defn tf [x]
-  (or (assert (instance? String x))
-      (assert (instance? Integer x))))
+  (assert (instance? Integer x)))
 
-(tf x)
+(defn tg [y]
+  (assert (instance? String y)))
+
+(defn th [z]
+   (tf z)
+   (tg z))
+
+(th 8)
 ")
 
 (main [_]
   ;; (print-err 'comp (unify (const/TypeConstraint {1 #{}} (list [_FILE_ _LINE_]) 'SomeType (maybe 'x) "")
   ;;                         (const/TypeConstraint {2 #{}} (list [_FILE_ _LINE_]) 'AnotherType (maybe 'y) "")))
-  (let [st (maybe ['_ {'types {'Integer {const/IntegerType #{}}
-                               'String {const/SubStringType #{}
-                                        const/StringBufferType #{}}}
-                       'subs {}
-                       'syms {}}])]
+  (let [st [['_ {'types {'Integer {const/IntegerType #{}}
+                          'String {const/SubStringType #{}
+                                   const/StringBufferType #{}}}
+                  'subs {}
+                  'syms {}}]]]
     (for [asts (analyze-forms {'file-name 'test
                                'line-number 1
                                'project-directory ""
                                'root-directory ""}
                               input-text)]
-      (print-err (reduce asts st
-                         (fn [st ast]
-                           (flat-map st (fn [[_ new-st]]
-                                          ((f ast) new-st)))))))))
+      (map (reduce asts st
+                   (fn [st ast]
+                     (flat-map st (fn [[_ new-st]]
+                                    ((f ast) new-st)))))
+           print-err))))
 
 ;; map over param constraints replacing with more restrictive arg constraints
 ;; remove any arg constratints that are satisfied by new param constraints
