@@ -1,0 +1,170 @@
+
+;; state-vect monad with lazy comp*
+
+;; (defn reduce-args [[arg & args] s final-result]
+;;   (assert (instance? Vector final-result))
+
+;;   (let [x (arg s)]
+;;     (and x (let [[result new-s] (extract x)]
+;;              (or (and (=* 0 (list-count args))
+;;                       (maybe [(conj final-result result) new-s]))
+;;                  (reduce-args args new-s (conj final-result result)))))))
+
+(deftype new-sv [invoke-fn]
+  (assert (instance? Fn invoke-fn))
+
+  Stringable
+  (string-list [x] (comp (list "<new-sv ")
+                         (string-list (.invoke-fn x))
+                         (list ">")))
+
+  Function
+  (invoke [ev s]
+    (invoke-fn s))
+
+  Container
+  (map [mv f]
+    (new-sv (fn [s]
+              (map (invoke-fn s)
+                   (fn [[v new-s]]
+                     [(f v) new-s])))))
+
+  (wrap [x v]
+    (new-sv (fn [s]
+              [[v s]])))
+
+  (flat-map [ev f]
+    (new-sv (fn [s]
+              (flat-map (invoke-fn s)
+                        (fn [[v ss]]
+                          ((f v) ss))))))
+
+  Composition
+  (zero [_] (new-sv (fn [_] [])))
+  (comp* [mv mvs]
+    (new-sv (fn [s]
+              (comp* (mv s) (map mvs (fn [mv] (mv s))))))))
+
+  ;; (apply [fv args]
+  ;;   (new-sv (fn [s]
+  ;;             (let [x (or (and (empty? args)
+  ;;                              (maybe [[] s]))
+  ;;                         (reduce-args args s []))]
+  ;;               (and x (let [[results s] (extract x)
+  ;;                            y (fv s)]
+  ;;                        (and y (let [[f s] (extract y)]
+  ;;                                 (or (and (empty? results)
+  ;;                                          (maybe [(f) s]))
+  ;;                                     (maybe [(apply f (seq results)) s]))))))))))
+
+(def state-vect
+  (reify
+    Type
+    (type-name [_]
+      "*state-vect wrapper*")
+
+    Container
+    (apply [_ [v]]
+      (new-sv (fn [s]
+                [[v s]])))
+
+    Function
+    (invoke [_ v]
+      (new-sv (fn [s]
+                [[v s]])))
+
+    Composition
+    (zero [_] (new-sv (fn [_] [])))))
+
+(def zero-sv
+  (zero state-vect))
+
+(defn get-val
+  ([k]
+   (new-sv (fn [s]
+             (either (map (get s k)
+                          (fn [v]
+                            [[v s]]))
+                     []))))
+
+  ([k nf]
+   (new-sv (fn [s]
+             (either (map (get s k)
+                          (fn [v]
+                            [[v s]]))
+                     [[nf s]])))))
+
+(defn set-val [k v]
+  (new-sv (fn [s]
+            [[v (assoc s k v)]])))
+
+(defn get-in-val
+  ([path]
+     (new-sv (fn [s]
+               (either (map (get-in s path)
+                            (fn [v]
+                              [[v s]]))
+                       []))))
+  ([path nf]
+     (new-sv (fn [s]
+               (either (map (get-in s path)
+                            (fn [v]
+                              [[v s]]))
+                       [[nf s]])))))
+
+(defn assoc-in-val [path v]
+  (new-sv (fn [s]
+            [[v (assoc-in s path v)]])))
+
+;; These will be implemented as needed
+
+;; (defn lift [f]
+;;   (fn [& args]
+;;     (new-sv (fn [s]
+;;               (maybe [(apply f args) s])))))
+
+;; (defn update-state [f]
+;;   (new-sv (fn [s]
+;;             (maybe [s (f s)]))))
+
+;; (defn update-val [key f]
+;;   (new-sv (fn [s]
+;;             (let [x (get s key)]
+;;               (and x (let [old-v (extract x)
+;;                            y (update-in s [key] f)]
+;;                        (and y (let [new-s (extract y)]
+;;                                 (maybe [old-v new-s])))))))))
+
+;; (defn update-in-val [path f]
+;;   (new-sv (fn [s]
+;;             (let [x (get-in s path)]
+;;               (and x (let [old-v (extract x)
+;;                            y (update-in s path f)]
+;;                        (and y (let [new-s (extract y)]
+;;                                 (maybe [old-v new-s])))))))))
+
+;; (defn recur-fn [f as s]
+;;   (assert (instance? Vector as))
+;;   (let [x (f s)]
+;;     (or (and (= nothing x)
+;;              (maybe [as s]))
+;;         (let [[v ss] (extract x)]
+;;           (recur-fn f (conj as v) ss)))))
+
+;; (defn recur [mv]
+;;   (new-sv (fn [s]
+;;             (let [x (mv s)]
+;;               (and x (let [[v ss] (extract x)
+;;                            y (recur-fn (.invoke-fn mv) [v] ss)]
+;;                        (and y (let [[vs s] (extract y)]
+;;                                 (maybe [vs s])))))))))
+
+;; (defn when [val]
+;;   (new-sv (fn [s]
+;;             (and val (let [v (extract val)]
+;;                        (maybe [v s]))))))
+
+;; (defn when-not [val]
+;;   (new-sv (fn [s]
+;;             (and (= nothing val)
+;;                  (maybe [nothing s])))))
